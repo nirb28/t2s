@@ -161,7 +161,8 @@ def setup_sidebar():
         
         for question in sample_questions:
             if st.button(question, key=f"sample_{hash(question)}"):
-                st.session_state.current_question = question
+                st.session_state.question_input = question
+                st.rerun()
 
 def initialize_vanna_app():
     """Initialize the Vanna application."""
@@ -221,7 +222,7 @@ def display_chat_history():
             # Display results
             if chat['results'] is not None and not chat['results'].empty:
                 st.subheader("📊 Query Results")
-                st.dataframe(chat['results'], use_container_width=True)
+                st.dataframe(chat['results'], width='stretch')
                 
                 # Auto-generate charts for numeric data
                 if len(chat['results'].columns) >= 2:
@@ -329,17 +330,13 @@ def main():
         # Chat interface
         st.header("💬 Chat Interface")
         
-        # Question input
+        # Question input - use session state value if set from sample questions
         question = st.text_input(
             "Ask a question about the music database:",
             placeholder="e.g., How many artists are in the database?",
-            key="question_input"
+            key="question_input",
+            value=st.session_state.get("question_input", "")
         )
-        
-        # Handle sample question selection
-        if 'current_question' in st.session_state:
-            question = st.session_state.current_question
-            del st.session_state.current_question
         
         # Process button
         if st.button("🚀 Ask Question", type="primary") and question.strip():
