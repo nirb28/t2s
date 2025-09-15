@@ -1,0 +1,18 @@
+# Vanna AI dependencies
+vanna[chromadb,openai]
+streamlit
+pandas
+plotly
+
+# Vector store
+faiss-cpu
+
+# Database
+# sqlite3 is part of Python standard library - no installation needed
+
+# NVIDIA API
+openai>=1.0.0
+
+# Additional utilities
+python-dotenv
+requests
