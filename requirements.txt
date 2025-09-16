@@ -1,11 +1,13 @@
-# Vanna AI dependencies
-vanna[chromadb,openai]
+# Vanna AI dependencies (removed chromadb, using remote embeddings)
+vanna[openai]
 streamlit
 pandas
 plotly
 
-# Vector store
-faiss-cpu
+# Remote embedding dependencies
+numpy
+scikit-learn
+requests
 
 # Database
 # sqlite3 is part of Python standard library - no installation needed
@@ -15,4 +17,3 @@ openai>=1.0.0
 
 # Additional utilities
 python-dotenv
-requests

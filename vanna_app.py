@@ -7,20 +7,383 @@ using NVIDIA's hosted LLM and FAISS for vector storage of training data.
 
 import os
 import sqlite3
+import requests
+import json
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import pandas as pd
 from dotenv import load_dotenv
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
 import vanna
 from vanna.remote import VannaDefault
 from vanna.openai import OpenAI_Chat
-from vanna.chromadb import ChromaDB_VectorStore
+from vanna.base import VannaBase
 
 # Load environment variables
 load_dotenv()
 
-class NVIDIAVannaAI(ChromaDB_VectorStore, OpenAI_Chat):
+class RemoteEmbeddingVectorStore(VannaBase):
+    """
+    Custom vector store that uses remote embedding endpoint from dsp_ai_rag2 model server.
+    This replaces local ChromaDB with remote HTTP-based embeddings for vector operations.
+    """
+    
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        """
+        Initialize the remote embedding vector store.
+        
+        Args:
+            config: Configuration dictionary with embedding server settings
+        """
+        self.config = config or {}
+        self.embedding_server_url = self.config.get('embedding_server_url', 'http://localhost:8080')
+        self.model_name = self.config.get('model_name', 'sentence-transformers/all-MiniLM-L6-v2')
+        self.storage_path = Path(self.config.get('storage_path', './remote_embeddings_storage'))
+        self.storage_path.mkdir(exist_ok=True)
+        
+        # In-memory storage for embeddings and associated data
+        self.embeddings = []  # List of embedding vectors
+        self.training_data = []  # List of training data items
+        self.ids = []  # List of unique IDs
+        
+        # Load existing data if available
+        self._load_storage()
+    
+    def _get_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """
+        Get embeddings from the remote model server.
+        
+        Args:
+            texts: List of texts to embed
+            
+        Returns:
+            List of embedding vectors
+        """
+        try:
+            url = f"{self.embedding_server_url}/embeddings"
+            payload = {
+                "texts": texts,
+                "model_name": self.model_name
+            }
+            
+            response = requests.post(url, json=payload, timeout=30)
+            response.raise_for_status()
+            
+            data = response.json()
+            return data['embeddings']
+            
+        except requests.exceptions.RequestException as e:
+            print(f"❌ Error calling remote embedding endpoint: {e}")
+            print(f"   URL: {url}")
+            print(f"   Model: {self.model_name}")
+            # Return zero embeddings as fallback
+            return [[0.0] * 384 for _ in texts]  # Default MiniLM dimension
+        except Exception as e:
+            print(f"❌ Error processing embedding response: {e}")
+            return [[0.0] * 384 for _ in texts]
+    
+    def add_question_sql(self, question: str, sql: str, **kwargs) -> str:
+        """
+        Add a question-SQL pair to the vector store.
+        
+        Args:
+            question: Natural language question
+            sql: Corresponding SQL query
+            
+        Returns:
+            Unique ID for the stored item
+        """
+        # Create combined text for embedding
+        combined_text = f"Question: {question}\nSQL: {sql}"
+        
+        # Get embedding
+        embeddings = self._get_embeddings([combined_text])
+        if not embeddings:
+            return ""
+        
+        # Generate unique ID
+        item_id = f"qs_{len(self.ids)}"
+        
+        # Store data
+        self.embeddings.append(embeddings[0])
+        self.training_data.append({
+            'id': item_id,
+            'question': question,
+            'sql': sql,
+            'type': 'question_sql',
+            'text': combined_text
+        })
+        self.ids.append(item_id)
+        
+        # Save to storage
+        self._save_storage()
+        
+        return item_id
+    
+    def add_ddl(self, ddl: str, **kwargs) -> str:
+        """
+        Add DDL (Data Definition Language) to the vector store.
+        
+        Args:
+            ddl: DDL statement
+            
+        Returns:
+            Unique ID for the stored item
+        """
+        # Get embedding
+        embeddings = self._get_embeddings([ddl])
+        if not embeddings:
+            return ""
+        
+        # Generate unique ID
+        item_id = f"ddl_{len(self.ids)}"
+        
+        # Store data
+        self.embeddings.append(embeddings[0])
+        self.training_data.append({
+            'id': item_id,
+            'ddl': ddl,
+            'type': 'ddl',
+            'text': ddl
+        })
+        self.ids.append(item_id)
+        
+        # Save to storage
+        self._save_storage()
+        
+        return item_id
+    
+    def add_documentation(self, documentation: str, **kwargs) -> str:
+        """
+        Add documentation to the vector store.
+        
+        Args:
+            documentation: Documentation text
+            
+        Returns:
+            Unique ID for the stored item
+        """
+        # Get embedding
+        embeddings = self._get_embeddings([documentation])
+        if not embeddings:
+            return ""
+        
+        # Generate unique ID
+        item_id = f"doc_{len(self.ids)}"
+        
+        # Store data
+        self.embeddings.append(embeddings[0])
+        self.training_data.append({
+            'id': item_id,
+            'documentation': documentation,
+            'type': 'documentation',
+            'text': documentation
+        })
+        self.ids.append(item_id)
+        
+        # Save to storage
+        self._save_storage()
+        
+        return item_id
+    
+    def get_related_ddl(self, question: str, **kwargs) -> List[str]:
+        """
+        Get DDL statements related to the question.
+        
+        Args:
+            question: Natural language question
+            
+        Returns:
+            List of related DDL statements
+        """
+        if not self.embeddings:
+            return []
+        
+        # Get question embedding
+        question_embeddings = self._get_embeddings([question])
+        if not question_embeddings:
+            return []
+        
+        question_embedding = np.array(question_embeddings[0]).reshape(1, -1)
+        
+        # Calculate similarities with DDL items
+        ddl_items = [item for item in self.training_data if item['type'] == 'ddl']
+        if not ddl_items:
+            return []
+        
+        ddl_embeddings = np.array([self.embeddings[self.training_data.index(item)] for item in ddl_items])
+        similarities = cosine_similarity(question_embedding, ddl_embeddings)[0]
+        
+        # Get top similar items
+        top_indices = np.argsort(similarities)[::-1][:5]
+        related_ddl = [ddl_items[i]['ddl'] for i in top_indices if similarities[i] > 0.3]
+        
+        return related_ddl
+    
+    def get_related_documentation(self, question: str, **kwargs) -> List[str]:
+        """
+        Get documentation related to the question.
+        
+        Args:
+            question: Natural language question
+            
+        Returns:
+            List of related documentation
+        """
+        if not self.embeddings:
+            return []
+        
+        # Get question embedding
+        question_embeddings = self._get_embeddings([question])
+        if not question_embeddings:
+            return []
+        
+        question_embedding = np.array(question_embeddings[0]).reshape(1, -1)
+        
+        # Calculate similarities with documentation items
+        doc_items = [item for item in self.training_data if item['type'] == 'documentation']
+        if not doc_items:
+            return []
+        
+        doc_embeddings = np.array([self.embeddings[self.training_data.index(item)] for item in doc_items])
+        similarities = cosine_similarity(question_embedding, doc_embeddings)[0]
+        
+        # Get top similar items
+        top_indices = np.argsort(similarities)[::-1][:3]
+        related_docs = [doc_items[i]['documentation'] for i in top_indices if similarities[i] > 0.3]
+        
+        return related_docs
+    
+    def get_similar_question_sql(self, question: str, **kwargs) -> List[Dict[str, str]]:
+        """
+        Get similar question-SQL pairs.
+        
+        Args:
+            question: Natural language question
+            
+        Returns:
+            List of similar question-SQL pairs
+        """
+        if not self.embeddings:
+            return []
+        
+        # Get question embedding
+        question_embeddings = self._get_embeddings([question])
+        if not question_embeddings:
+            return []
+        
+        question_embedding = np.array(question_embeddings[0]).reshape(1, -1)
+        
+        # Calculate similarities with question-SQL items
+        qs_items = [item for item in self.training_data if item['type'] == 'question_sql']
+        if not qs_items:
+            return []
+        
+        qs_embeddings = np.array([self.embeddings[self.training_data.index(item)] for item in qs_items])
+        similarities = cosine_similarity(question_embedding, qs_embeddings)[0]
+        
+        # Get top similar items
+        top_indices = np.argsort(similarities)[::-1][:3]
+        similar_pairs = [
+            {'question': qs_items[i]['question'], 'sql': qs_items[i]['sql']}
+            for i in top_indices if similarities[i] > 0.3
+        ]
+        
+        return similar_pairs
+    
+    def _save_storage(self):
+        """Save embeddings and training data to disk."""
+        try:
+            storage_file = self.storage_path / 'embeddings_data.json'
+            data = {
+                'embeddings': self.embeddings,
+                'training_data': self.training_data,
+                'ids': self.ids,
+                'config': self.config
+            }
+            with open(storage_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"Warning: Could not save embeddings data: {e}")
+    
+    def _load_storage(self):
+        """Load embeddings and training data from disk."""
+        try:
+            storage_file = self.storage_path / 'embeddings_data.json'
+            if storage_file.exists():
+                with open(storage_file, 'r') as f:
+                    data = json.load(f)
+                self.embeddings = data.get('embeddings', [])
+                self.training_data = data.get('training_data', [])
+                self.ids = data.get('ids', [])
+        except Exception as e:
+            print(f"Warning: Could not load embeddings data: {e}")
+            # Initialize empty storage
+            self.embeddings = []
+            self.training_data = []
+            self.ids = []
+    
+    # Abstract method implementations required by VannaBase
+    def generate_embedding(self, data: str, **kwargs) -> List[float]:
+        """Generate embedding for a single text string."""
+        embeddings = self._get_embeddings([data])
+        return embeddings[0] if embeddings else [0.0] * 384
+    
+    def submit_prompt(self, prompt: str, **kwargs) -> str:
+        """Submit prompt - not used in vector store, returns empty string."""
+        return ""
+    
+    def system_message(self, message: str) -> str:
+        """System message - not used in vector store, returns message as-is."""
+        return message
+    
+    def user_message(self, message: str) -> str:
+        """User message - not used in vector store, returns message as-is."""
+        return message
+    
+    def assistant_message(self, message: str) -> str:
+        """Assistant message - not used in vector store, returns message as-is."""
+        return message
+    
+    def get_training_data(self, **kwargs) -> pd.DataFrame:
+        """Get training data as pandas DataFrame."""
+        if not self.training_data:
+            return pd.DataFrame()
+        
+        # Convert training data to DataFrame format
+        rows = []
+        for item in self.training_data:
+            row = {'id': item['id'], 'training_data_type': item['type']}
+            if item['type'] == 'question_sql':
+                row.update({'question': item['question'], 'content': item['sql']})
+            elif item['type'] == 'ddl':
+                row.update({'question': '', 'content': item['ddl']})
+            elif item['type'] == 'documentation':
+                row.update({'question': '', 'content': item['documentation']})
+            rows.append(row)
+        
+        return pd.DataFrame(rows)
+    
+    def remove_training_data(self, id: str, **kwargs) -> bool:
+        """Remove training data by ID."""
+        try:
+            # Find and remove the item
+            for i, item in enumerate(self.training_data):
+                if item['id'] == id:
+                    # Remove from all lists at the same index
+                    del self.training_data[i]
+                    del self.embeddings[i]
+                    del self.ids[i]
+                    self._save_storage()
+                    return True
+            return False
+        except Exception as e:
+            print(f"Error removing training data: {e}")
+            return False
+
+class NVIDIAVannaAI(RemoteEmbeddingVectorStore, OpenAI_Chat):
     """
     Custom Vanna AI implementation using NVIDIA's hosted LLM and ChromaDB (FAISS-backed) vector store.
     This class combines NVIDIA's language model capabilities with efficient vector storage
@@ -39,10 +402,14 @@ class NVIDIAVannaAI(ChromaDB_VectorStore, OpenAI_Chat):
         if not nvidia_api_key:
             raise ValueError("NVIDIA API key is required. Set NVIDIA_API_KEY environment variable or pass in config.")
         
-        # Initialize ChromaDB vector store
-        ChromaDB_VectorStore.__init__(self, config={
-            'path': './vanna_vectordb',
-            'model': 'all-MiniLM-L6-v2'  # Sentence transformer model for embeddings
+        # Initialize remote embedding vector store
+        embedding_server_url = config.get('embedding_server_url') if config else os.getenv('EMBEDDING_SERVER_URL', 'http://localhost:8080')
+        embedding_model = config.get('embedding_model') if config else os.getenv('EMBEDDING_MODEL', 'sentence-transformers/all-MiniLM-L6-v2')
+        
+        RemoteEmbeddingVectorStore.__init__(self, config={
+            'embedding_server_url': embedding_server_url,
+            'model_name': embedding_model,
+            'storage_path': './vanna_remote_embeddings'
         })
         
         # Initialize OpenAI chat (compatible with NVIDIA API)
